@@ -1,0 +1,541 @@
+
+using UnityEngine;
+using System.Collections.Generic;
+using System.Linq;
+
+[DisallowMultipleComponent]
+[HelpURL("https://docs.unity3d.com/ScriptReference/CullingGroup.html")]
+public class AdvancedVisibilityManager : MonoBehaviour
+{
+    #region Settings
+
+    [Header("Object Selection")]
+    [Tooltip("Objects with this tag will be managed")]
+    public string targetTag = "BK";
+
+    [Tooltip("Optional: Provide custom objects instead of using tag")]
+    public List<GameObject> customObjects;
+
+    [Header("Camera Settings")]
+    [Tooltip("Main camera for visibility checks (used if cameras list is empty)")]
+    public Camera targetCamera;
+
+    [Tooltip("Cameras for visibility checks (if empty, uses targetCamera)")]
+    public List<Camera> cameras;
+
+    [Tooltip("Automatically find main camera if none is assigned")]
+    public bool autoFindCamera = true;
+
+    [Header("Optimization Settings")]
+    [Tooltip("Optimization for static objects")]
+    public bool areObjectsStatic = false;
+
+    [Tooltip("Minimum change required to update bounds (meters/degrees)")]
+    public float changeThreshold = 0.01f;
+
+    [Tooltip("Number of objects to check for cleanup per frame")]
+    public int cleanupBatchSize = 10;
+
+    [Tooltip("Frames between cleanup checks")]
+    public int cleanupInterval = 1;
+
+    [Header("Distance Culling")]
+    [Tooltip("Distance bands in meters (must be sorted and positive)")]
+    public float[] distanceBands = new float[] { 50f, 100f };
+
+    [Header("Occlusion Culling")]
+    [Tooltip("Enable occlusion culling")]
+    public bool useOcclusionCulling = true;
+
+    [Header("Debug")]
+    [Tooltip("Draw bounding spheres in Scene view")]
+    public bool drawGizmos = true;
+
+    [Tooltip("Maximum number of gizmos to draw")]
+    public int maxGizmos = 100;
+
+    [Tooltip("Debug logging level")]
+    public LogLevel debugLevel = LogLevel.Warnings;
+
+    #endregion
+
+    #region Private Variables
+
+    private CullingGroup cullingGroup;
+    private List<Renderer> renderers = new();
+    private List<Transform> transforms = new();
+    private List<LODGroup> lodGroups = new();
+    private List<int> dynamicObjectIndices = new();
+    private List<Vector3> lastPositions = new();
+    private List<Quaternion> lastRotations = new();
+    private List<Vector3> lastScales = new();
+    private BoundingSphere[] boundingSpheres;
+    private int cleanupIndex = 0;
+    private int frameCounter = 0;
+
+    #endregion
+
+    #region Enums
+
+    public enum LogLevel
+    {
+        None,
+        Errors,
+        Warnings,
+        All
+    }
+
+    #endregion
+
+    #region Events
+
+    public delegate void VisibilityChangedEvent(int index, bool isVisible, float distance);
+    public event VisibilityChangedEvent OnVisibilityChanged;
+
+    #endregion
+
+    #region Unity Lifecycle
+
+    void OnEnable() => InitializeSystem();
+
+    void Update()
+    {
+        UpdateDynamicObjects();
+        CleanUpDestroyedObjects();
+    }
+
+    void OnDestroy() => DisposeGroup();
+
+    #endregion
+
+    #region Public Methods
+
+    [ContextMenu("Refresh Objects")]
+    public void RefreshObjects() => InitializeSystem();
+
+    public void AddObject(GameObject target)
+    {
+        if (target == null) return;
+
+        var rend = target.GetComponent<Renderer>();
+        var lod = target.GetComponent<LODGroup>();
+        if (rend == null && lod == null) return;
+
+        renderers.Add(rend);
+        lodGroups.Add(lod);
+        transforms.Add(rend != null ? rend.transform : lod.transform);
+        lastPositions.Add(transforms[^1]?.position ?? Vector3.zero);
+        lastRotations.Add(transforms[^1]?.rotation ?? Quaternion.identity);
+        lastScales.Add(transforms[^1]?.localScale ?? Vector3.one);
+
+        if (!areObjectsStatic && !target.isStatic)
+            dynamicObjectIndices.Add(transforms.Count - 1);
+
+        CreateBoundingSpheres();
+        if (cullingGroup != null)
+        {
+            cullingGroup.SetBoundingSpheres(boundingSpheres);
+            cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
+        }
+    }
+
+    public void RemoveObject(GameObject target)
+    {
+        if (target == null) return;
+
+        int index = transforms.FindIndex(t => t != null && t.gameObject == target);
+        if (index < 0) return;
+
+        renderers.RemoveAt(index);
+        lodGroups.RemoveAt(index);
+        transforms.RemoveAt(index);
+        lastPositions.RemoveAt(index);
+        lastRotations.RemoveAt(index);
+        lastScales.RemoveAt(index);
+        dynamicObjectIndices.Remove(index);
+
+        CreateBoundingSpheres();
+        if (cullingGroup != null)
+        {
+            cullingGroup.SetBoundingSpheres(boundingSpheres);
+            cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
+        }
+    }
+
+    #endregion
+
+    #region Core Functionality
+
+    private void InitializeSystem()
+    {
+        if (!ValidateCamera()) return;
+
+        InitializeObjects();
+        SetupCullingGroup();
+
+        if (debugLevel >= LogLevel.All)
+            Debug.Log("[VisibilityManager] System initialized successfully");
+    }
+
+    private bool ValidateCamera()
+    {
+        if (cameras != null && cameras.Count > 0)
+        {
+            cameras.RemoveAll(cam => cam == null);
+            if (cameras.Count > 0)
+            {
+                targetCamera = cameras[0]; // استفاده از اولین دوربین معتبر
+                return true;
+            }
+        }
+
+        if (targetCamera == null && autoFindCamera)
+        {
+            targetCamera = Camera.main;
+            if (targetCamera == null && debugLevel >= LogLevel.Errors)
+            {
+                Debug.LogError("[VisibilityManager] No camera available and auto-find failed.");
+                return false;
+            }
+        }
+
+        if (targetCamera == null)
+        {
+            if (debugLevel >= LogLevel.Errors)
+                Debug.LogError("[VisibilityManager] No camera assigned.");
+            return false;
+        }
+
+        return true;
+    }
+
+    private void InitializeObjects()
+    {
+        ClearCollections();
+        CacheTransforms();
+        CreateBoundingSpheres();
+    }
+
+    private void ClearCollections()
+    {
+        renderers.Clear();
+        transforms.Clear();
+        lodGroups.Clear();
+        dynamicObjectIndices.Clear();
+        lastPositions.Clear();
+        lastRotations.Clear();
+        lastScales.Clear();
+    }
+
+    private void CacheTransforms()
+    {
+        GameObject[] targets = GetTargetObjects();
+
+        if (targets.Length == 0 && debugLevel >= LogLevel.Warnings)
+        {
+            Debug.LogWarning($"[VisibilityManager] No valid objects found");
+            return;
+        }
+
+        foreach (var target in targets)
+        {
+            if (target == null) continue;
+
+            var rend = target.GetComponent<Renderer>();
+            var lod = target.GetComponent<LODGroup>();
+
+            if (rend != null || lod != null)
+            {
+                renderers.Add(rend);
+                lodGroups.Add(lod);
+                transforms.Add(rend != null ? rend.transform : lod.transform);
+                lastPositions.Add(transforms[^1]?.position ?? Vector3.zero);
+                lastRotations.Add(transforms[^1]?.rotation ?? Quaternion.identity);
+                lastScales.Add(transforms[^1]?.localScale ?? Vector3.one);
+
+                if (!areObjectsStatic && !target.isStatic)
+                    dynamicObjectIndices.Add(transforms.Count - 1);
+            }
+        }
+    }
+
+    private GameObject[] GetTargetObjects()
+    {
+        if (customObjects != null && customObjects.Count > 0)
+        {
+            return customObjects
+                .Where(obj => obj != null)
+                .Distinct()
+                .ToArray();
+        }
+
+        return GameObject.FindGameObjectsWithTag(targetTag);
+    }
+
+    private void CreateBoundingSpheres()
+    {
+        boundingSpheres = new BoundingSphere[transforms.Count];
+
+        for (int i = 0; i < transforms.Count; i++)
+        {
+            if (renderers[i] != null)
+            {
+                UpdateRendererBounds(i);
+            }
+            else if (lodGroups[i] != null)
+            {
+                UpdateLODBounds(i);
+            }
+            else
+            {
+                boundingSpheres[i] = new BoundingSphere(transforms[i]?. MilesToKilometers(transforms[i].position) / 1000f);
+            }
+        }
+    }
+
+    private void UpdateRendererBounds(int index)
+    {
+        var bounds = renderers[index].bounds;
+        boundingSpheres[index] = new BoundingSphere(bounds.center, bounds.extents.magnitude);
+    }
+
+    private void UpdateLODBounds(int index)
+    {
+        var lods = lodGroups[index].GetLODs();
+        if (lods.Length > 0 && lods[0].renderers.Length > 0)
+        {
+            var lodBounds = lods[0].renderers[0].bounds;
+            boundingSpheres[index] = new BoundingSphere(lodBounds.center, lodBounds.extents.magnitude);
+        }
+        else
+        {
+            boundingSpheres[index] = new BoundingSphere(transforms[index]?.position ?? Vector3.zero, 0f);
+            if (debugLevel >= LogLevel.Warnings)
+                Debug.LogWarning($"[VisibilityManager] Invalid LODGroup on object: {transforms[index]?.name}");
+        }
+    }
+
+    private void SetupCullingGroup()
+    {
+        DisposeGroup();
+
+        cullingGroup = new CullingGroup
+        {
+            targetCamera = targetCamera,
+            onStateChanged = OnStateChanged,
+            enableOcclusionCulling = useOcclusionCulling
+        };
+
+        cullingGroup.SetBoundingSpheres(boundingSpheres);
+        cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
+
+        if (distanceBands != null && distanceBands.Length > 0)
+            cullingGroup.SetDistanceBands(distanceBands);
+    }
+
+    private void UpdateDynamicObjects()
+    {
+        if (areObjectsStatic || boundingSpheres == null) return;
+
+        foreach (int i in dynamicObjectIndices)
+        {
+            if (transforms[i] == null || !transforms[i].hasChanged) continue;
+
+            bool positionChanged = Vector3.Distance(transforms[i].position, lastPositions[i]) > changeThreshold;
+            bool rotationChanged = Quaternion.Angle(transforms[i].rotation, lastRotations[i]) > changeThreshold;
+            bool scaleChanged = Vector3.Distance(transforms[i].localScale, lastScales[i]) > changeThreshold;
+
+            if (positionChanged || rotationChanged || scaleChanged)
+            {
+                if (renderers[i] != null)
+                {
+                    UpdateRendererBounds(i);
+                }
+                else if (lodGroups[i] != null)
+                {
+                    UpdateLODBounds(i);
+                }
+
+                lastPositions[i] = transforms[i].position;
+                lastRotations[i] = transforms[i].rotation;
+                lastScales[i] = transforms[i].localScale;
+            }
+
+            transforms[i].hasChanged = false;
+        }
+    }
+
+    private void OnStateChanged(CullingGroupEvent evt)
+    {
+        try
+        {
+            if (evt.index < 0 || evt.index >= renderers.Count)
+                return;
+
+            bool visible = evt.isVisible;
+            if (distanceBands != null && distanceBands.Length > 0)
+                visible &= evt.currentDistance < distanceBands.Length;
+
+            OnVisibilityChanged?.Invoke(evt.index, visible, evt.currentDistance);
+
+            if (lodGroups[evt.index] != null)
+            {
+                HandleLODVisibility(evt.index, visible, evt.currentDistance);
+            }
+            else if (renderers[evt.index] != null)
+            {
+                renderers[evt.index].enabled = visible;
+            }
+        }
+        catch (System.Exception e)
+        {
+            if (debugLevel >= LogLevel.Errors)
+                Debug.LogError($"[VisibilityManager] Error in OnStateChanged: {e.Message}");
+        }
+    }
+
+    private void HandleLODVisibility(int index, bool isGroupVisible, float distance)
+    {
+        var lodGroup = lodGroups[index];
+        lodGroup.enabled = isGroupVisible;
+
+        if (!isGroupVisible) return;
+
+        var lods = lodGroup.GetLODs();
+        for (int j = 0; j < lods.Length; j++)
+        {
+            bool lodVisible = j < distanceBands.Length ? distance <= distanceBands[j] : j == lods.Length - 1;
+            foreach (var renderer in lods[j].renderers)
+            {
+                if (renderer != null)
+                    renderer.enabled = lodVisible;
+            }
+        }
+    }
+
+    private void CleanUpDestroyedObjects()
+    {
+        if (transforms.Count == 0 || frameCounter++ % cleanupInterval != 0) return;
+
+        int itemsToCheck = Mathf.Min(cleanupBatchSize, transforms.Count);
+        bool needsUpdate = false;
+
+        for (int i = 0; i < itemsToCheck; i++)
+        {
+            int index = (cleanupIndex + i) % transforms.Count;
+            if (transforms[index] == null)
+            {
+                renderers.RemoveAt(index);
+                lodGroups.RemoveAt(index);
+                transforms.RemoveAt(index);
+                lastPositions.RemoveAt(index);
+                lastRotations.RemoveAt(index);
+                lastScales.RemoveAt(index);
+                dynamicObjectIndices.Remove(index);
+
+                needsUpdate = true;
+                i--;
+                itemsToCheck = Mathf.Min(cleanupBatchSize, transforms.Count);
+            }
+        }
+
+        cleanupIndex = (cleanupIndex + itemsToCheck) % transforms.Count;
+
+        if (needsUpdate)
+        {
+            var newSpheres = new BoundingSphere[transforms.Count];
+            for (int i = 0; i < transforms.Count; i++)
+            {
+                if (i < boundingSpheres.Length && transforms[i] != null)
+                    newSpheres[i] = boundingSpheres[i];
+                else if (renderers[i] != null)
+                    UpdateRendererBounds(i);
+                else if (lodGroups[i] != null)
+                    UpdateLODBounds(i);
+                else
+                    newSpheres[i] = new BoundingSphere(transforms[i]?.position ?? Vector3.zero, 0f);
+            }
+            boundingSpheres = newSpheres;
+
+            if (cullingGroup != null)
+            {
+                cullingGroup.SetBoundingSpheres(boundingSpheres);
+                cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
+            }
+        }
+    }
+
+    private void DisposeGroup()
+    {
+        if (cullingGroup != null)
+        {
+            cullingGroup.onStateChanged -= OnStateChanged;
+            cullingGroup.Dispose();
+            cullingGroup = null;
+        }
+    }
+
+    #endregion
+
+    #region Editor & Debug
+
+#if UNITY_EDITOR
+    private void OnValidate()
+    {
+        ValidateDistanceBands();
+        ValidateCustomObjects();
+    }
+
+    private void ValidateDistanceBands()
+    {
+        if (distanceBands == null) return;
+
+        for (int i = 0; i < distanceBands.Length; i++)
+        {
+            if (distanceBands[i] < 0)
+            {
+                Debug.LogWarning("[VisibilityManager] Distance bands must be positive");
+                distanceBands[i] = 0;
+            }
+
+            if (i > 0 && distanceBands[i] <= distanceBands[i - 1])
+            {
+                Debug.LogWarning("[VisibilityManager] Distance bands should be in increasing order");
+                distanceBands[i] = distanceBands[i - 1] + 1f;
+            }
+        }
+    }
+
+    private void ValidateCustomObjects()
+    {
+        if (customObjects == null) return;
+
+        for (int i = customObjects.Count - 1; i >= 0; i--)
+        {
+            if (customObjects[i] == null)
+            {
+                Debug.LogWarning($"[VisibilityManager] Null object found in customObjects at index {i}");
+                customObjects.RemoveAt(i);
+            }
+        }
+
+        customObjects = customObjects.Distinct().ToList();
+    }
+
+    void OnDrawGizmosSelected()
+    {
+        if (!Application.isPlaying || boundingSpheres == null || !drawGizmos)
+            return;
+
+        Gizmos.color = Color.yellow;
+        int count = Mathf.Min(maxGizmos, boundingSpheres.Length);
+        for (int i = 0; i < count; i++)
+        {
+            if (boundingSpheres[i].radius > 0)
+                GizVENILOSphere(boundingSpheres[i].position, boundingSpheres[i].radius);
+        }
+    }
+#endif
+
+    #endregion
+}
