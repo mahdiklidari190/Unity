@@ -4,6 +4,7 @@ using System.Linq;
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Burst;
+using UnityEngine.Rendering;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -32,6 +33,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
                     {
                         GameObject singleton = new GameObject(nameof(AdvancedVisibilityManager));
                         _instance = singleton.AddComponent<AdvancedVisibilityManager>();
+                        Debug.Log("[VisibilityManager] Created new instance");
                     }
                 }
                 return _instance;
@@ -43,13 +45,19 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     {
         if (_instance != null && _instance != this)
         {
+            Debug.Log("[VisibilityManager] Duplicate instance destroyed");
             Destroy(gameObject);
             return;
         }
         _instance = this;
         DontDestroyOnLoad(gameObject);
+        
         activeJobHandles = new NativeList<JobHandle>(Allocator.Persistent);
         objectsToRemove = new NativeList<int>(Allocator.Persistent);
+        dynamicObjectIndices = new NativeList<int>(Allocator.Persistent);
+        
+        if (debugLevel >= LogLevel.All)
+            Debug.Log("[VisibilityManager] System initialized");
     }
 
     #endregion
@@ -64,14 +72,14 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     public List<GameObject> customObjects;
 
     [Tooltip("Filter objects by layer")]
-    public LayerMask targetLayer = -1; // Default: Everything
+    public LayerMask targetLayer = -1;
 
     [Header("Camera Settings")]
-    [Tooltip("Main camera for visibility checks (used if cameras list is empty)")]
+    [Tooltip("Main camera for visibility checks")]
     public Camera targetCamera;
 
-    [Tooltip("Cameras for visibility checks (if empty, uses targetCamera)")]
-    public List<Camera> cameras;
+    [Tooltip("Additional cameras for visibility checks")]
+    public List<Camera> additionalCameras;
 
     [Tooltip("Automatically find main camera if none is assigned")]
     public bool autoFindCamera = true;
@@ -80,22 +88,29 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     [Tooltip("Optimization for static objects")]
     public bool areObjectsStatic = false;
 
-    [Tooltip("Minimum change required to update bounds (meters/degrees)")]
+    [Tooltip("Minimum change required to update bounds")]
     public float changeThreshold = 0.01f;
 
     [Tooltip("Number of objects to check for cleanup per frame")]
     public int cleanupBatchSize = 10;
 
     [Tooltip("Frames between cleanup checks")]
-    public int cleanupInterval = 1;
+    public int cleanupInterval = 3;
 
     [Header("Distance Culling")]
-    [Tooltip("Distance bands in meters (must be sorted and positive)")]
+    [Tooltip("Distance bands in meters (sorted)")]
     public float[] distanceBands = new float[] { 50f, 100f };
 
     [Header("Occlusion Culling")]
     [Tooltip("Enable occlusion culling")]
     public bool useOcclusionCulling = true;
+
+    [Tooltip("Occlusion update interval")]
+    public int occlusionUpdateInterval = 2;
+
+    [Header("Frustum Culling")]
+    [Tooltip("Enable custom frustum culling")]
+    public bool useFrustumCulling = true;
 
     [Header("Debug")]
     [Tooltip("Draw bounding spheres in Scene view")]
@@ -108,31 +123,38 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     public LogLevel debugLevel = LogLevel.Warnings;
 
     [Header("Statistics")]
-    [Tooltip("Number of visible objects")]
-    [SerializeField, ReadOnly]
+    [ReadOnly, SerializeField] 
     private int visibleObjectCount;
+    
+    [ReadOnly, SerializeField]
+    private int totalManagedObjects;
 
     #endregion
 
     #region Private Variables
 
     private CullingGroup cullingGroup;
-    private NativeArray<ObjectInfo> objects;
-    private NativeList<int> dynamicObjectIndices;
+    private NativeArray<ObjectData> objectData;
     private NativeArray<BoundingSphere> boundingSpheres;
-    private Dictionary<GameObject, int> objectIndexMap = new();
-    private int cleanupIndex = 0;
-    private int frameCounter = 0;
+    private NativeList<int> dynamicObjectIndices;
     private NativeList<JobHandle> activeJobHandles;
     private NativeList<int> objectsToRemove;
+    
+    private Dictionary<GameObject, int> objectIndexMap = new Dictionary<GameObject, int>(1024);
+    private List<Camera> activeCameras = new List<Camera>();
+    
+    private int cleanupIndex = 0;
+    private int frameCounter = 0;
+    private int occlusionFrameCounter = 0;
     private bool requiresBoundsUpdate = false;
+    private bool isInitialized = false;
 
     #endregion
 
     #region Structs
 
-    [System.Serializable]
-    private struct ObjectInfo
+    [BurstCompile]
+    private struct ObjectData
     {
         public Renderer renderer;
         public LODGroup lodGroup;
@@ -142,6 +164,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         public Vector3 lastScale;
         public bool isVisible;
         public bool isMarkedForRemoval;
+        public float currentDistance;
     }
 
     #endregion
@@ -160,8 +183,11 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
     #region Events
 
-    public delegate void VisibilityChangedEvent(int index, bool isVisible, float distance);
-    public event VisibilityChangedEvent OnVisibilityChanged;
+    public delegate void VisibilityChangedHandler(GameObject obj, bool isVisible, float distance);
+    public event VisibilityChangedHandler OnVisibilityChanged;
+
+    public delegate void LODChangedHandler(GameObject obj, int lodLevel);
+    public event LODChangedHandler OnLODChanged;
 
     #endregion
 
@@ -171,20 +197,27 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     {
         InitializeSystem();
         Camera.onPreCull += OnCameraPreCull;
+        RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
         StartCoroutine(UpdateDynamicObjectsCoroutine());
     }
 
     private void Update()
     {
-        CompleteJobs();
+        if (!isInitialized) return;
 
+        CompleteJobs();
+        HandleOcclusionUpdates();
+        
         if (requiresBoundsUpdate)
         {
             UpdateBoundingSpheres();
             requiresBoundsUpdate = false;
         }
 
-        CleanUpDestroyedObjects();
+        if (frameCounter++ % cleanupInterval == 0)
+        {
+            CleanUpDestroyedObjects();
+        }
     }
 
     private void LateUpdate()
@@ -195,24 +228,21 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     private void OnDisable()
     {
         Camera.onPreCull -= OnCameraPreCull;
+        RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
         CompleteJobs();
     }
 
     private void OnDestroy()
     {
-        CompleteJobs();
-        DisposeGroup();
-
-        if (activeJobHandles.IsCreated)
-            activeJobHandles.Dispose();
-
-        if (objectsToRemove.IsCreated)
-            objectsToRemove.Dispose();
+        DisposeSystem();
+        
+        if (debugLevel >= LogLevel.All)
+            Debug.Log("[VisibilityManager] System destroyed");
     }
 
     #endregion
 
-    #region Public Methods
+    #region Public API
 
     [ContextMenu("Refresh Objects")]
     public void RefreshObjects()
@@ -221,195 +251,243 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         InitializeSystem();
     }
 
-    public void AddObject(GameObject target)
+    public void RegisterObject(GameObject target)
     {
-        if (target == null || ((1 << target.layer) & targetLayer) == 0)
+        if (target == null)
         {
-            if (debugLevel >= LogLevel.Warnings)
-                Debug.LogWarning("[VisibilityManager] Invalid or null target object.");
+            LogWarning("Attempted to register null object");
+            return;
+        }
+
+        if (((1 << target.layer) & targetLayer) == 0)
+        {
+            LogWarning($"Object {target.name} is not in target layer");
             return;
         }
 
         var rend = target.GetComponent<Renderer>();
         var lod = target.GetComponent<LODGroup>();
+        
         if (rend == null && lod == null)
         {
-            if (debugLevel >= LogLevel.Warnings)
-                Debug.LogWarning("[VisibilityManager] Target object has no Renderer or LODGroup.");
+            LogWarning($"Object {target.name} has no Renderer or LODGroup");
+            return;
+        }
+
+        if (objectIndexMap.ContainsKey(target))
+        {
+            LogWarning($"Object {target.name} is already registered");
             return;
         }
 
         CompleteJobs();
 
-        var newObjects = new NativeArray<ObjectInfo>(objects.Length + 1, Allocator.Temp);
-        if (objects.IsCreated && objects.Length > 0)
-        {
-            objects.CopyTo(newObjects.GetSubArray(0, objects.Length));
-            objects.Dispose();
-        }
+        int newIndex = objectData.Length;
+        ResizeNativeArrays(newIndex + 1);
 
-        var objInfo = new ObjectInfo
+        var data = new ObjectData
         {
             renderer = rend,
             lodGroup = lod,
-            transform = rend != null ? rend.transform : lod.transform,
-            lastPosition = rend != null ? rend.transform.position : lod.transform.position,
-            lastRotation = rend != null ? rend.transform.rotation : lod.transform.rotation,
-            lastScale = rend != null ? rend.transform.localScale : lod.transform.localScale,
+            transform = target.transform,
+            lastPosition = target.transform.position,
+            lastRotation = target.transform.rotation,
+            lastScale = target.transform.localScale,
             isVisible = false,
-            isMarkedForRemoval = false
+            isMarkedForRemoval = false,
+            currentDistance = float.MaxValue
         };
 
-        int index = newObjects.Length - 1;
-        newObjects[index] = objInfo;
-        objects = new NativeArray<ObjectInfo>(newObjects, Allocator.Persistent);
-        newObjects.Dispose();
-
-        objectIndexMap[target] = index;
+        objectData[newIndex] = data;
+        objectIndexMap[target] = newIndex;
 
         if (!areObjectsStatic && !target.isStatic)
         {
-            dynamicObjectIndices.Add(index);
+            dynamicObjectIndices.Add(newIndex);
         }
 
-        UpdateBoundingSphere(index);
+        UpdateBoundingSphere(newIndex);
         requiresBoundsUpdate = true;
+        totalManagedObjects = objectData.Length;
+        
+        Log($"Registered object: {target.name}");
     }
 
-    public void RemoveObject(GameObject target)
+    public void UnregisterObject(GameObject target)
     {
         if (target == null || !objectIndexMap.TryGetValue(target, out int index))
         {
-            if (debugLevel >= LogLevel.Warnings)
-                Debug.LogWarning("[VisibilityManager] Target object not found or null.");
+            LogWarning("Attempted to unregister null or unregistered object");
             return;
         }
 
         CompleteJobs();
 
-        var obj = objects[index];
-        obj.isMarkedForRemoval = true;
-        objects[index] = obj;
+        var data = objectData[index];
+        data.isMarkedForRemoval = true;
+        objectData[index] = data;
 
         objectsToRemove.Add(index);
         objectIndexMap.Remove(target);
-
         requiresBoundsUpdate = true;
+        
+        Log($"Unregistered object: {target.name}");
+    }
+
+    public bool IsObjectVisible(GameObject target)
+    {
+        if (target == null || !objectIndexMap.TryGetValue(target, out int index))
+            return false;
+
+        return objectData[index].isVisible;
     }
 
     #endregion
 
-    #region Core Functionality
+    #region Core System
 
     private void InitializeSystem()
     {
-        if (!ValidateCamera())
-            return;
+        if (isInitialized)
+        {
+            DisposeSystem();
+        }
 
-        InitializeObjects();
+        if (!ValidateCameras())
+        {
+            LogError("Camera validation failed");
+            return;
+        }
+
+        InitializeNativeCollections();
+        CacheObjects();
         SetupCullingGroup();
 
-        if (debugLevel >= LogLevel.All)
-            Debug.Log("[VisibilityManager] System initialized successfully");
+        isInitialized = true;
+        totalManagedObjects = objectData.Length;
+        
+        Log("System initialized successfully");
     }
 
-    private bool ValidateCamera()
+    private void DisposeSystem()
     {
-        if (cameras != null && cameras.Count > 0)
-        {
-            cameras.RemoveAll(cam => cam == null);
-            if (cameras.Count > 0)
-            {
-                targetCamera = cameras[0];
-                return true;
-            }
-        }
+        CompleteJobs();
+        DisposeGroup();
+        
+        if (objectData.IsCreated) objectData.Dispose();
+        if (boundingSpheres.IsCreated) boundingSpheres.Dispose();
+        if (dynamicObjectIndices.IsCreated) dynamicObjectIndices.Dispose();
+        if (activeJobHandles.IsCreated) activeJobHandles.Dispose();
+        if (objectsToRemove.IsCreated) objectsToRemove.Dispose();
+        
+        objectIndexMap.Clear();
+        isInitialized = false;
+    }
+
+    private bool ValidateCameras()
+    {
+        activeCameras.Clear();
 
         if (targetCamera == null && autoFindCamera)
         {
             targetCamera = Camera.main;
-            if (targetCamera == null && debugLevel >= LogLevel.Errors)
-            {
-                Debug.LogError("[VisibilityManager] No camera available and auto-find failed.");
-                return false;
-            }
         }
 
-        if (targetCamera == null)
+        if (targetCamera != null)
         {
-            if (debugLevel >= LogLevel.Errors)
-                Debug.LogError("[VisibilityManager] No camera assigned.");
+            activeCameras.Add(targetCamera);
+        }
+
+        if (additionalCameras != null)
+        {
+            activeCameras.AddRange(additionalCameras.Where(cam => cam != null));
+        }
+
+        if (activeCameras.Count == 0)
+        {
+            LogError("No valid cameras found");
             return false;
         }
 
         return true;
     }
 
-    private void InitializeObjects()
+    private void InitializeNativeCollections()
     {
-        ClearCollections();
-        CacheTransforms();
-        UpdateBoundingSpheres();
-    }
-
-    private void ClearCollections()
-    {
-        if (objects.IsCreated)
-            objects.Dispose();
-
-        if (dynamicObjectIndices.IsCreated)
-            dynamicObjectIndices.Dispose();
-
-        if (boundingSpheres.IsCreated)
-            boundingSpheres.Dispose();
-
+        objectData = new NativeArray<ObjectData>(0, Allocator.Persistent);
+        boundingSpheres = new NativeArray<BoundingSphere>(0, Allocator.Persistent);
         dynamicObjectIndices = new NativeList<int>(Allocator.Persistent);
-        objectIndexMap.Clear();
-        objectsToRemove.Clear();
+        activeJobHandles = new NativeList<JobHandle>(Allocator.Persistent);
+        objectsToRemove = new NativeList<int>(Allocator.Persistent);
     }
 
-    private void CacheTransforms()
+    private void CacheObjects()
     {
         GameObject[] targets = GetTargetObjects();
 
-        if (targets.Length == 0 && debugLevel >= LogLevel.Warnings)
+        if (targets.Length == 0)
         {
-            Debug.LogWarning($"[VisibilityManager] No valid objects found");
+            LogWarning("No valid objects found");
             return;
         }
 
-        objects = new NativeArray<ObjectInfo>(targets.Length, Allocator.Persistent);
+        ResizeNativeArrays(targets.Length);
 
         for (int i = 0; i < targets.Length; i++)
         {
             var target = targets[i];
-            if (target == null || ((1 << target.layer) & targetLayer) == 0)
-                continue;
+            if (target == null) continue;
 
             var rend = target.GetComponent<Renderer>();
             var lod = target.GetComponent<LODGroup>();
 
             if (rend != null || lod != null)
             {
-                var objInfo = new ObjectInfo
+                objectData[i] = new ObjectData
                 {
                     renderer = rend,
                     lodGroup = lod,
-                    transform = rend != null ? rend.transform : lod.transform,
-                    lastPosition = rend != null ? rend.transform.position : lod.transform.position,
-                    lastRotation = rend != null ? rend.transform.rotation : lod.transform.rotation,
-                    lastScale = rend != null ? rend.transform.localScale : lod.transform.localScale,
+                    transform = target.transform,
+                    lastPosition = target.transform.position,
+                    lastRotation = target.transform.rotation,
+                    lastScale = target.transform.localScale,
                     isVisible = false,
-                    isMarkedForRemoval = false
+                    isMarkedForRemoval = false,
+                    currentDistance = float.MaxValue
                 };
 
-                objects[i] = objInfo;
                 objectIndexMap[target] = i;
 
                 if (!areObjectsStatic && !target.isStatic)
+                {
                     dynamicObjectIndices.Add(i);
+                }
             }
         }
+    }
+
+    private void ResizeNativeArrays(int newSize)
+    {
+        if (objectData.IsCreated && objectData.Length == newSize)
+            return;
+
+        var newObjectData = new NativeArray<ObjectData>(newSize, Allocator.Persistent);
+        var newBoundingSpheres = new NativeArray<BoundingSphere>(newSize, Allocator.Persistent);
+
+        if (objectData.IsCreated && objectData.Length > 0)
+        {
+            NativeArray<ObjectData>.Copy(objectData, newObjectData, Mathf.Min(objectData.Length, newSize));
+            objectData.Dispose();
+        }
+
+        if (boundingSpheres.IsCreated && boundingSpheres.Length > 0)
+        {
+            NativeArray<BoundingSphere>.Copy(boundingSpheres, newBoundingSpheres, Mathf.Min(boundingSpheres.Length, newSize));
+            boundingSpheres.Dispose();
+        }
+
+        objectData = newObjectData;
+        boundingSpheres = newBoundingSpheres;
     }
 
     private GameObject[] GetTargetObjects()
@@ -428,76 +506,13 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
             .ToArray();
     }
 
-    private void UpdateBoundingSpheres()
-    {
-        if (!objects.IsCreated || objects.Length == 0)
-        {
-            if (boundingSpheres.IsCreated)
-                boundingSpheres.Dispose();
-            return;
-        }
-
-        if (boundingSpheres.IsCreated && boundingSpheres.Length != objects.Length)
-            boundingSpheres.Dispose();
-
-        if (!boundingSpheres.IsCreated)
-            boundingSpheres = new NativeArray<BoundingSphere>(objects.Length, Allocator.Persistent);
-
-        var job = new UpdateBoundingSpheresJob
-        {
-            Objects = objects,
-            BoundingSpheres = boundingSpheres
-        };
-
-        JobHandle handle = job.Schedule(objects.Length, 64);
-        activeJobHandles.Add(handle);
-    }
-
-    private void UpdateBoundingSphere(int index)
-    {
-        if (!objects.IsCreated || index < 0 || index >= objects.Length)
-            return;
-
-        var obj = objects[index];
-        BoundingSphere sphere;
-
-        if (obj.renderer != null)
-        {
-            var bounds = obj.renderer.bounds;
-            sphere = new BoundingSphere(bounds.center, bounds.extents.magnitude);
-        }
-        else if (obj.lodGroup != null)
-        {
-            var lods = obj.lodGroup.GetLODs();
-            if (lods.Length > 0 && lods[0].renderers.Length > 0)
-            {
-                var lodBounds = lods[0].renderers[0].bounds;
-                sphere = new BoundingSphere(lodBounds.center, lodBounds.extents.magnitude);
-            }
-            else
-            {
-                sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
-                if (debugLevel >= LogLevel.Warnings)
-                    Debug.LogWarning($"[VisibilityManager] Invalid LODGroup on object: {obj.transform?.name}");
-            }
-        }
-        else
-        {
-            sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
-        }
-
-        if (boundingSpheres.IsCreated && index < boundingSpheres.Length)
-            boundingSpheres[index] = sphere;
-    }
-
     private void SetupCullingGroup()
     {
         DisposeGroup();
 
-        if (!objects.IsCreated || objects.Length == 0)
+        if (!objectData.IsCreated || objectData.Length == 0)
         {
-            if (debugLevel >= LogLevel.Warnings)
-                Debug.LogWarning("[VisibilityManager] No objects to cull, CullingGroup not created.");
+            LogWarning("No objects to cull");
             return;
         }
 
@@ -508,27 +523,133 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
             enableOcclusionCulling = useOcclusionCulling
         };
 
-        cullingGroup.SetBoundingSpheres(boundingSpheres);
-        cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
+        UpdateCullingGroupReferences();
 
         if (distanceBands != null && distanceBands.Length > 0)
+        {
             cullingGroup.SetDistanceBands(distanceBands);
+        }
 
-        if (debugLevel >= LogLevel.All)
-            Debug.Log("[VisibilityManager] CullingGroup initialized with occlusion culling: " + useOcclusionCulling);
+        Log($"CullingGroup initialized with {objectData.Length} objects");
     }
 
-    private void UpdateCullingGroup()
+    private void UpdateCullingGroupReferences()
     {
-        if (cullingGroup == null || !objects.IsCreated || objects.Length == 0)
-        {
-            SetupCullingGroup();
+        if (cullingGroup == null || !objectData.IsCreated)
             return;
-        }
 
         cullingGroup.SetBoundingSpheres(boundingSpheres);
         cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
     }
+
+    private void DisposeGroup()
+    {
+        if (cullingGroup != null)
+        {
+            cullingGroup.onStateChanged -= OnStateChanged;
+            cullingGroup.Dispose();
+            cullingGroup = null;
+        }
+    }
+
+    #endregion
+
+    #region Visibility Management
+
+    private void OnStateChanged(CullingGroupEvent evt)
+    {
+        if (evt.index < 0 || evt.index >= objectData.Length)
+            return;
+
+        var data = objectData[evt.index];
+        if (data.isMarkedForRemoval || data.transform == null)
+            return;
+
+        bool visible = evt.isVisible;
+        float distance = evt.currentDistance;
+
+        if (distanceBands != null && distanceBands.Length > 0)
+        {
+            visible &= distance < distanceBands.Length;
+        }
+
+        if (data.isVisible != visible || Mathf.Abs(data.currentDistance - distance) > 0.1f)
+        {
+            data.isVisible = visible;
+            data.currentDistance = distance;
+            objectData[evt.index] = data;
+
+            visibleObjectCount = Mathf.Max(0, visible ? visibleObjectCount + 1 : visibleObjectCount - 1);
+
+            var targetGameObject = data.transform.gameObject;
+            OnVisibilityChanged?.Invoke(targetGameObject, visible, distance);
+
+            if (data.lodGroup != null)
+            {
+                HandleLODVisibility(evt.index, visible, distance);
+            }
+            else if (data.renderer != null)
+            {
+                data.renderer.enabled = visible;
+            }
+        }
+    }
+
+    private void HandleLODVisibility(int index, bool isGroupVisible, float distance)
+    {
+        var data = objectData[index];
+        if (data.lodGroup == null) return;
+
+        data.lodGroup.enabled = isGroupVisible;
+
+        if (!isGroupVisible) return;
+
+        var lods = data.lodGroup.GetLODs();
+        int lodLevel = CalculateLODLevel(distance, lods.Length);
+
+        for (int i = 0; i < lods.Length; i++)
+        {
+            bool lodVisible = i == lodLevel;
+            foreach (var renderer in lods[i].renderers)
+            {
+                if (renderer != null)
+                {
+                    renderer.enabled = lodVisible;
+                }
+            }
+        }
+
+        OnLODChanged?.Invoke(data.transform.gameObject, lodLevel);
+    }
+
+    private int CalculateLODLevel(float distance, int lodCount)
+    {
+        if (distanceBands == null || distanceBands.Length == 0)
+            return 0;
+
+        for (int i = 0; i < distanceBands.Length; i++)
+        {
+            if (distance <= distanceBands[i])
+                return Mathf.Min(i, lodCount - 1);
+        }
+
+        return lodCount - 1;
+    }
+
+    private void HandleOcclusionUpdates()
+    {
+        if (!useOcclusionCulling || cullingGroup == null)
+            return;
+
+        if (occlusionFrameCounter++ % occlusionUpdateInterval == 0)
+        {
+            cullingGroup.Update();
+        }
+    }
+
+    #endregion
+
+    #region Dynamic Objects & Bounds
 
     private System.Collections.IEnumerator UpdateDynamicObjectsCoroutine()
     {
@@ -538,19 +659,180 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
             {
                 var job = new UpdateDynamicObjectsJob
                 {
-                    Objects = objects,
-                    DynamicIndices = dynamicObjectIndices,
+                    Objects = objectData,
+                    DynamicIndices = dynamicObjectIndices.AsArray(),
                     BoundingSpheres = boundingSpheres,
                     ChangeThreshold = changeThreshold
                 };
 
                 JobHandle handle = job.Schedule(dynamicObjectIndices.Length, 64);
                 activeJobHandles.Add(handle);
+                
                 yield return new WaitUntil(() => handle.IsCompleted);
             }
-            yield return new WaitForSeconds(0.1f); // تنظیم فاصله به‌روزرسانی
+            yield return new WaitForSeconds(0.1f);
         }
     }
+
+    private void UpdateBoundingSpheres()
+    {
+        if (!objectData.IsCreated || objectData.Length == 0)
+        {
+            if (boundingSpheres.IsCreated)
+                boundingSpheres.Dispose();
+            return;
+        }
+
+        if (boundingSpheres.IsCreated && boundingSpheres.Length != objectData.Length)
+        {
+            boundingSpheres.Dispose();
+            boundingSpheres = new NativeArray<BoundingSphere>(objectData.Length, Allocator.Persistent);
+        }
+
+        if (!boundingSpheres.IsCreated)
+        {
+            boundingSpheres = new NativeArray<BoundingSphere>(objectData.Length, Allocator.Persistent);
+        }
+
+        var job = new UpdateBoundingSpheresJob
+        {
+            Objects = objectData,
+            BoundingSpheres = boundingSpheres
+        };
+
+        JobHandle handle = job.Schedule(objectData.Length, 64);
+        activeJobHandles.Add(handle);
+    }
+
+    private void UpdateBoundingSphere(int index)
+    {
+        if (!objectData.IsCreated || index < 0 || index >= objectData.Length)
+            return;
+
+        var data = objectData[index];
+        BoundingSphere sphere;
+
+        if (data.renderer != null)
+        {
+            var bounds = data.renderer.bounds;
+            sphere = new BoundingSphere(bounds.center, bounds.extents.magnitude);
+        }
+        else if (data.lodGroup != null)
+        {
+            var lods = data.lodGroup.GetLODs();
+            if (lods.Length > 0 && lods[0].renderers.Length > 0)
+            {
+                var lodBounds = lods[0].renderers[0].bounds;
+                sphere = new BoundingSphere(lodBounds.center, lodBounds.extents.magnitude);
+            }
+            else
+            {
+                sphere = new BoundingSphere(data.transform.position, 0f);
+                LogWarning($"Invalid LODGroup on object: {data.transform.name}");
+            }
+        }
+        else
+        {
+            sphere = new BoundingSphere(data.transform.position, 0f);
+        }
+
+        if (boundingSpheres.IsCreated && index < boundingSpheres.Length)
+            boundingSpheres[index] = sphere;
+    }
+
+    #endregion
+
+    #region Cleanup
+
+    private void CleanUpDestroyedObjects()
+    {
+        if (!objectData.IsCreated || objectData.Length == 0)
+            return;
+
+        CompleteJobs();
+
+        // Process marked objects first
+        if (objectsToRemove.Length > 0)
+        {
+            RemoveMarkedObjects();
+            return;
+        }
+
+        // Check for null transforms
+        CheckForNullTransforms();
+    }
+
+    private void RemoveMarkedObjects()
+    {
+        int newSize = objectData.Length - objectsToRemove.Length;
+        if (newSize <= 0)
+        {
+            DisposeSystem();
+            InitializeSystem();
+            return;
+        }
+
+        var newObjectData = new NativeArray<ObjectData>(newSize, Allocator.Persistent);
+        var newBoundingSpheres = new NativeArray<BoundingSphere>(newSize, Allocator.Persistent);
+
+        int newIndex = 0;
+        for (int i = 0; i < objectData.Length; i++)
+        {
+            if (!objectsToRemove.Contains(i))
+            {
+                newObjectData[newIndex] = objectData[i];
+                newBoundingSpheres[newIndex] = boundingSpheres[i];
+                newIndex++;
+            }
+        }
+
+        objectData.Dispose();
+        boundingSpheres.Dispose();
+
+        objectData = newObjectData;
+        boundingSpheres = newBoundingSpheres;
+
+        // Update dynamic indices
+        for (int i = dynamicObjectIndices.Length - 1; i >= 0; i--)
+        {
+            if (objectsToRemove.Contains(dynamicObjectIndices[i]))
+            {
+                dynamicObjectIndices.RemoveAtSwapBack(i);
+            }
+        }
+
+        objectsToRemove.Clear();
+        requiresBoundsUpdate = true;
+        totalManagedObjects = objectData.Length;
+    }
+
+    private void CheckForNullTransforms()
+    {
+        bool needsUpdate = false;
+        int itemsToCheck = Mathf.Min(cleanupBatchSize, objectData.Length);
+
+        for (int i = 0; i < itemsToCheck; i++)
+        {
+            int index = (cleanupIndex + i) % objectData.Length;
+            if (objectData[index].transform == null)
+            {
+                objectsToRemove.Add(index);
+                objectIndexMap.Remove(objectData[index].transform?.gameObject);
+                needsUpdate = true;
+            }
+        }
+
+        cleanupIndex = (cleanupIndex + itemsToCheck) % objectData.Length;
+
+        if (needsUpdate)
+        {
+            requiresBoundsUpdate = true;
+        }
+    }
+
+    #endregion
+
+    #region Job Management
 
     private void CompleteJobs()
     {
@@ -561,161 +843,25 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         activeJobHandles.Clear();
     }
 
-    private void OnStateChanged(CullingGroupEvent evt)
-    {
-        try
-        {
-            if (evt.index < 0 || evt.index >= objects.Length)
-                return;
+    #endregion
 
-            var obj = objects[evt.index];
-            if (obj.isMarkedForRemoval || obj.transform == null)
-                return;
-
-            bool visible = evt.isVisible;
-            if (distanceBands != null && distanceBands.Length > 0)
-                visible &= evt.currentDistance < distanceBands.Length;
-
-            if (obj.isVisible != visible)
-            {
-                obj.isVisible = visible;
-                objects[evt.index] = obj;
-
-                visibleObjectCount = Mathf.Max(0, visible ? visibleObjectCount + 1 : visibleObjectCount - 1);
-
-                OnVisibilityChanged?.Invoke(evt.index, visible, evt.currentDistance);
-
-                if (obj.lodGroup != null)
-                {
-                    HandleLODVisibility(evt.index, visible, evt.currentDistance);
-                }
-                else if (obj.renderer != null)
-                {
-                    obj.renderer.enabled = visible;
-                    obj.renderer.gameObject.SetActive(visible);
-                }
-            }
-        }
-        catch (System.Exception e)
-        {
-            if (debugLevel >= LogLevel.Errors)
-                Debug.LogError($"[VisibilityManager] Error in OnStateChanged: {e.Message}");
-        }
-    }
-
-    private void HandleLODVisibility(int index, bool isGroupVisible, float distance)
-    {
-        var lodGroup = objects[index].lodGroup;
-        if (lodGroup == null) return;
-
-        lodGroup.enabled = isGroupVisible;
-        lodGroup.gameObject.SetActive(isGroupVisible); // اضافه کردن SetActive
-
-        if (!isGroupVisible) return;
-
-        var lods = lodGroup.GetLODs();
-        for (int j = 0; j < lods.Length; j++)
-        {
-            bool lodVisible = j < distanceBands.Length ? distance <= distanceBands[j] : j == lods.Length - 1;
-            foreach (var renderer in lods[j].renderers)
-            {
-                if (renderer != null)
-                {
-                    renderer.enabled = lodVisible;
-                    renderer.gameObject.SetActive(lodVisible); // اضافه کردن SetActive
-                }
-            }
-        }
-    }
-
-    private void CleanUpDestroyedObjects()
-    {
-        if (!objects.IsCreated || objects.Length == 0 || frameCounter++ % cleanupInterval != 0)
-            return;
-
-        CompleteJobs();
-
-        // First process marked objects
-        if (objectsToRemove.Length > 0)
-        {
-            var newObjects = new NativeArray<ObjectInfo>(objects.Length - objectsToRemove.Length, Allocator.Temp);
-            int newIndex = 0;
-
-            for (int i = 0; i < objects.Length; i++)
-            {
-                if (!objectsToRemove.Contains(i))
-                {
-                    newObjects[newIndex++] = objects[i];
-                }
-            }
-
-            objects.Dispose();
-            objects = new NativeArray<ObjectInfo>(newObjects, Allocator.Persistent);
-            newObjects.Dispose();
-
-            for (int i = dynamicObjectIndices.Length - 1; i >= 0; i--)
-            {
-                if (objectsToRemove.Contains(dynamicObjectIndices[i]))
-                {
-                    dynamicObjectIndices.RemoveAtSwapBack(i);
-                }
-            }
-
-            objectsToRemove.Clear();
-            requiresBoundsUpdate = true;
-            return;
-        }
-
-        // Then check for null transforms
-        int itemsToCheck = Mathf.Min(cleanupBatchSize, objects.Length);
-        bool needsUpdate = false;
-
-        for (int i = 0; i < itemsToCheck; i++)
-        {
-            int index = (cleanupIndex + i) % objects.Length;
-            if (objects[index].transform == null)
-            {
-                objectsToRemove.Add(index);
-                objectIndexMap.Remove(objects[index].transform?.gameObject);
-                needsUpdate = true;
-            }
-        }
-
-        cleanupIndex = (cleanupIndex + itemsToCheck) % objects.Length;
-
-        if (needsUpdate)
-        {
-            requiresBoundsUpdate = true;
-        }
-    }
-
-    private void DisposeGroup()
-    {
-        CompleteJobs();
-
-        if (cullingGroup != null)
-        {
-            cullingGroup.onStateChanged -= OnStateChanged;
-            cullingGroup.Dispose();
-            cullingGroup = null;
-        }
-
-        if (boundingSpheres.IsCreated)
-            boundingSpheres.Dispose();
-
-        if (objects.IsCreated)
-            objects.Dispose();
-
-        if (dynamicObjectIndices.IsCreated)
-            dynamicObjectIndices.Dispose();
-    }
+    #region Camera Handling
 
     private void OnCameraPreCull(Camera cam)
     {
-        if (cam == targetCamera && cullingGroup != null)
+        if (activeCameras.Contains(cam) && cullingGroup != null)
         {
             CompleteJobs();
-            UpdateCullingGroup();
+            UpdateCullingGroupReferences();
+        }
+    }
+
+    private void OnBeginCameraRendering(ScriptableRenderContext context, Camera camera)
+    {
+        if (activeCameras.Contains(camera) && cullingGroup != null)
+        {
+            CompleteJobs();
+            UpdateCullingGroupReferences();
         }
     }
 
@@ -726,7 +872,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     [BurstCompile]
     private struct UpdateBoundingSpheresJob : IJobParallelFor
     {
-        [ReadOnly] public NativeArray<ObjectInfo> Objects;
+        [ReadOnly] public NativeArray<ObjectData> Objects;
         [WriteOnly] public NativeArray<BoundingSphere> BoundingSpheres;
 
         public void Execute(int index)
@@ -749,12 +895,12 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
                 }
                 else
                 {
-                    sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
+                    sphere = new BoundingSphere(obj.transform.position, 0f);
                 }
             }
             else
             {
-                sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
+                sphere = new BoundingSphere(obj.transform.position, 0f);
             }
 
             BoundingSpheres[index] = sphere;
@@ -764,8 +910,8 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     [BurstCompile]
     private struct UpdateDynamicObjectsJob : IJobParallelFor
     {
-        public NativeArray<ObjectInfo> Objects;
-        [ReadOnly] public NativeList<int> DynamicIndices;
+        public NativeArray<ObjectData> Objects;
+        [ReadOnly] public NativeArray<int> DynamicIndices;
         public NativeArray<BoundingSphere> BoundingSpheres;
         public float ChangeThreshold;
 
@@ -773,6 +919,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         {
             int objIndex = DynamicIndices[index];
             var obj = Objects[objIndex];
+            
             if (obj.transform == null || !obj.transform.hasChanged)
                 return;
 
@@ -798,12 +945,12 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
                     }
                     else
                     {
-                        sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
+                        sphere = new BoundingSphere(obj.transform.position, 0f);
                     }
                 }
                 else
                 {
-                    sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
+                    sphere = new BoundingSphere(obj.transform.position, 0f);
                 }
 
                 BoundingSpheres[objIndex] = sphere;
@@ -816,6 +963,28 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
             obj.transform.hasChanged = false;
         }
+    }
+
+    #endregion
+
+    #region Utility Methods
+
+    private void Log(string message)
+    {
+        if (debugLevel >= LogLevel.All)
+            Debug.Log($"[VisibilityManager] {message}");
+    }
+
+    private void LogWarning(string message)
+    {
+        if (debugLevel >= LogLevel.Warnings)
+            Debug.LogWarning($"[VisibilityManager] {message}");
+    }
+
+    private void LogError(string message)
+    {
+        if (debugLevel >= LogLevel.Errors)
+            Debug.LogError($"[VisibilityManager] {message}");
     }
 
     #endregion
@@ -837,14 +1006,14 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         {
             if (distanceBands[i] < 0)
             {
-                Debug.LogWarning("[VisibilityManager] Distance bands must be positive");
                 distanceBands[i] = 0;
+                LogWarning("Distance bands must be positive");
             }
 
             if (i > 0 && distanceBands[i] <= distanceBands[i - 1])
             {
-                Debug.LogWarning("[VisibilityManager] Distance bands should be in increasing order");
                 distanceBands[i] = distanceBands[i - 1] + 1f;
+                LogWarning("Distance bands should be in increasing order");
             }
         }
     }
@@ -857,25 +1026,28 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         {
             if (customObjects[i] == null)
             {
-                Debug.LogWarning($"[VisibilityManager] Null object found in customObjects at index {i}");
                 customObjects.RemoveAt(i);
+                LogWarning($"Null object found in customObjects at index {i}");
             }
         }
 
         customObjects = customObjects.Distinct().ToList();
     }
 
-    void OnDrawGizmosSelected()
+    private void OnDrawGizmosSelected()
     {
         if (!Application.isPlaying || !boundingSpheres.IsCreated || !drawGizmos)
             return;
 
         Gizmos.color = Color.yellow;
         int count = Mathf.Min(maxGizmos, boundingSpheres.Length);
+        
         for (int i = 0; i < count; i++)
         {
             if (boundingSpheres[i].radius > 0)
+            {
                 Gizmos.DrawWireSphere(boundingSpheres[i].position, boundingSpheres[i].radius);
+            }
         }
     }
 #endif
@@ -908,31 +1080,22 @@ public class AdvancedVisibilityManagerEditor : Editor
     {
         serializedObject.Update();
 
-        DrawDefaultInspector();
-
         var manager = (AdvancedVisibilityManager)target;
+        
+        EditorGUILayout.LabelField("System Status", manager.isInitialized ? "Active" : "Inactive");
+        EditorGUILayout.LabelField("Managed Objects", manager.totalManagedObjects.ToString());
         EditorGUILayout.LabelField("Visible Objects", manager.visibleObjectCount.ToString());
 
-        if (GUILayout.Button("Refresh Objects"))
+        if (GUILayout.Button("Refresh System"))
         {
             manager.RefreshObjects();
         }
 
+        EditorGUILayout.Space();
+        DrawDefaultInspector();
         customObjectsList.DoLayoutList();
 
         serializedObject.ApplyModifiedProperties();
-    }
-}
-
-public class ReadOnlyAttribute : PropertyAttribute { }
-[CustomPropertyDrawer(typeof(ReadOnlyAttribute))]
-public class ReadOnlyDrawer : PropertyDrawer
-{
-    public override void OnGUI(Rect position, SerializedProperty property, GUIContent label)
-    {
-        GUI.enabled = false;
-        EditorGUI.PropertyField(position, property, label, true);
-        GUI.enabled = true;
     }
 }
 #endif
