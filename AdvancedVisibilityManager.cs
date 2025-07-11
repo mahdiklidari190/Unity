@@ -14,6 +14,46 @@ using UnityEditorInternal;
 [HelpURL("https://docs.unity3d.com/ScriptReference/CullingGroup.html")]
 public sealed class AdvancedVisibilityManager : MonoBehaviour
 {
+    #region Singleton
+
+    private static AdvancedVisibilityManager _instance;
+    private static readonly object _lock = new object();
+
+    public static AdvancedVisibilityManager Instance
+    {
+        get
+        {
+            lock (_lock)
+            {
+                if (_instance == null)
+                {
+                    _instance = FindObjectOfType<AdvancedVisibilityManager>();
+                    if (_instance == null)
+                    {
+                        GameObject singleton = new GameObject(nameof(AdvancedVisibilityManager));
+                        _instance = singleton.AddComponent<AdvancedVisibilityManager>();
+                    }
+                }
+                return _instance;
+            }
+        }
+    }
+
+    private void Awake()
+    {
+        if (_instance != null && _instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        _instance = this;
+        DontDestroyOnLoad(gameObject);
+        activeJobHandles = new NativeList<JobHandle>(Allocator.Persistent);
+        objectsToRemove = new NativeList<int>(Allocator.Persistent);
+    }
+
+    #endregion
+
     #region Settings
 
     [Header("Object Selection")]
@@ -127,51 +167,45 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
     #region Unity Lifecycle
 
-    void Awake()
-    {
-        activeJobHandles = new NativeList<JobHandle>(Allocator.Persistent);
-        objectsToRemove = new NativeList<int>(Allocator.Persistent);
-    }
-
-    void OnEnable()
+    private void OnEnable()
     {
         InitializeSystem();
         Camera.onPreCull += OnCameraPreCull;
+        StartCoroutine(UpdateDynamicObjectsCoroutine());
     }
 
-    void Update()
+    private void Update()
     {
         CompleteJobs();
-        
+
         if (requiresBoundsUpdate)
         {
             UpdateBoundingSpheres();
             requiresBoundsUpdate = false;
         }
 
-        ScheduleDynamicObjectsJob();
         CleanUpDestroyedObjects();
     }
 
-    void LateUpdate()
+    private void LateUpdate()
     {
         CompleteJobs();
     }
 
-    void OnDisable()
+    private void OnDisable()
     {
         Camera.onPreCull -= OnCameraPreCull;
         CompleteJobs();
     }
 
-    void OnDestroy()
+    private void OnDestroy()
     {
         CompleteJobs();
         DisposeGroup();
-        
+
         if (activeJobHandles.IsCreated)
             activeJobHandles.Dispose();
-            
+
         if (objectsToRemove.IsCreated)
             objectsToRemove.Dispose();
     }
@@ -189,13 +223,21 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
     public void AddObject(GameObject target)
     {
-        if (target == null || ((1 << target.layer) & targetLayer) == 0) 
+        if (target == null || ((1 << target.layer) & targetLayer) == 0)
+        {
+            if (debugLevel >= LogLevel.Warnings)
+                Debug.LogWarning("[VisibilityManager] Invalid or null target object.");
             return;
+        }
 
         var rend = target.GetComponent<Renderer>();
         var lod = target.GetComponent<LODGroup>();
-        if (rend == null && lod == null) 
+        if (rend == null && lod == null)
+        {
+            if (debugLevel >= LogLevel.Warnings)
+                Debug.LogWarning("[VisibilityManager] Target object has no Renderer or LODGroup.");
             return;
+        }
 
         CompleteJobs();
 
@@ -236,18 +278,22 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
     public void RemoveObject(GameObject target)
     {
-        if (target == null || !objectIndexMap.TryGetValue(target, out int index)) 
+        if (target == null || !objectIndexMap.TryGetValue(target, out int index))
+        {
+            if (debugLevel >= LogLevel.Warnings)
+                Debug.LogWarning("[VisibilityManager] Target object not found or null.");
             return;
+        }
 
         CompleteJobs();
 
         var obj = objects[index];
         obj.isMarkedForRemoval = true;
         objects[index] = obj;
-        
+
         objectsToRemove.Add(index);
         objectIndexMap.Remove(target);
-        
+
         requiresBoundsUpdate = true;
     }
 
@@ -257,7 +303,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
     private void InitializeSystem()
     {
-        if (!ValidateCamera()) 
+        if (!ValidateCamera())
             return;
 
         InitializeObjects();
@@ -310,10 +356,10 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     {
         if (objects.IsCreated)
             objects.Dispose();
-            
+
         if (dynamicObjectIndices.IsCreated)
             dynamicObjectIndices.Dispose();
-            
+
         if (boundingSpheres.IsCreated)
             boundingSpheres.Dispose();
 
@@ -337,7 +383,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         for (int i = 0; i < targets.Length; i++)
         {
             var target = targets[i];
-            if (target == null || ((1 << target.layer) & targetLayer) == 0) 
+            if (target == null || ((1 << target.layer) & targetLayer) == 0)
                 continue;
 
             var rend = target.GetComponent<Renderer>();
@@ -462,10 +508,14 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
             enableOcclusionCulling = useOcclusionCulling
         };
 
-        UpdateCullingGroup();
+        cullingGroup.SetBoundingSpheres(boundingSpheres);
+        cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
 
         if (distanceBands != null && distanceBands.Length > 0)
             cullingGroup.SetDistanceBands(distanceBands);
+
+        if (debugLevel >= LogLevel.All)
+            Debug.Log("[VisibilityManager] CullingGroup initialized with occlusion culling: " + useOcclusionCulling);
     }
 
     private void UpdateCullingGroup()
@@ -480,21 +530,26 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
     }
 
-    private void ScheduleDynamicObjectsJob()
+    private System.Collections.IEnumerator UpdateDynamicObjectsCoroutine()
     {
-        if (areObjectsStatic || !boundingSpheres.IsCreated || dynamicObjectIndices.Length == 0) 
-            return;
-
-        var job = new UpdateDynamicObjectsJob
+        while (true)
         {
-            Objects = objects,
-            DynamicIndices = dynamicObjectIndices,
-            BoundingSpheres = boundingSpheres,
-            ChangeThreshold = changeThreshold
-        };
+            if (!areObjectsStatic && boundingSpheres.IsCreated && dynamicObjectIndices.Length > 0)
+            {
+                var job = new UpdateDynamicObjectsJob
+                {
+                    Objects = objects,
+                    DynamicIndices = dynamicObjectIndices,
+                    BoundingSpheres = boundingSpheres,
+                    ChangeThreshold = changeThreshold
+                };
 
-        JobHandle handle = job.Schedule(dynamicObjectIndices.Length, 64);
-        activeJobHandles.Add(handle);
+                JobHandle handle = job.Schedule(dynamicObjectIndices.Length, 64);
+                activeJobHandles.Add(handle);
+                yield return new WaitUntil(() => handle.IsCompleted);
+            }
+            yield return new WaitForSeconds(0.1f); // تنظیم فاصله به‌روزرسانی
+        }
     }
 
     private void CompleteJobs()
@@ -521,20 +576,24 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
             if (distanceBands != null && distanceBands.Length > 0)
                 visible &= evt.currentDistance < distanceBands.Length;
 
-            obj.isVisible = visible;
-            objects[evt.index] = obj;
-
-            visibleObjectCount = Mathf.Max(0, visible ? visibleObjectCount + 1 : visibleObjectCount - 1);
-
-            OnVisibilityChanged?.Invoke(evt.index, visible, evt.currentDistance);
-
-            if (obj.lodGroup != null)
+            if (obj.isVisible != visible)
             {
-                HandleLODVisibility(evt.index, visible, evt.currentDistance);
-            }
-            else if (obj.renderer != null)
-            {
-                obj.renderer.enabled = visible;
+                obj.isVisible = visible;
+                objects[evt.index] = obj;
+
+                visibleObjectCount = Mathf.Max(0, visible ? visibleObjectCount + 1 : visibleObjectCount - 1);
+
+                OnVisibilityChanged?.Invoke(evt.index, visible, evt.currentDistance);
+
+                if (obj.lodGroup != null)
+                {
+                    HandleLODVisibility(evt.index, visible, evt.currentDistance);
+                }
+                else if (obj.renderer != null)
+                {
+                    obj.renderer.enabled = visible;
+                    obj.renderer.gameObject.SetActive(visible);
+                }
             }
         }
         catch (System.Exception e)
@@ -550,6 +609,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         if (lodGroup == null) return;
 
         lodGroup.enabled = isGroupVisible;
+        lodGroup.gameObject.SetActive(isGroupVisible); // اضافه کردن SetActive
 
         if (!isGroupVisible) return;
 
@@ -560,14 +620,17 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
             foreach (var renderer in lods[j].renderers)
             {
                 if (renderer != null)
+                {
                     renderer.enabled = lodVisible;
+                    renderer.gameObject.SetActive(lodVisible); // اضافه کردن SetActive
+                }
             }
         }
     }
 
     private void CleanUpDestroyedObjects()
     {
-        if (!objects.IsCreated || objects.Length == 0 || frameCounter++ % cleanupInterval != 0) 
+        if (!objects.IsCreated || objects.Length == 0 || frameCounter++ % cleanupInterval != 0)
             return;
 
         CompleteJobs();
@@ -577,7 +640,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         {
             var newObjects = new NativeArray<ObjectInfo>(objects.Length - objectsToRemove.Length, Allocator.Temp);
             int newIndex = 0;
-            
+
             for (int i = 0; i < objects.Length; i++)
             {
                 if (!objectsToRemove.Contains(i))
@@ -585,12 +648,11 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
                     newObjects[newIndex++] = objects[i];
                 }
             }
-            
+
             objects.Dispose();
             objects = new NativeArray<ObjectInfo>(newObjects, Allocator.Persistent);
             newObjects.Dispose();
-            
-            // Update dynamic indices
+
             for (int i = dynamicObjectIndices.Length - 1; i >= 0; i--)
             {
                 if (objectsToRemove.Contains(dynamicObjectIndices[i]))
@@ -598,7 +660,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
                     dynamicObjectIndices.RemoveAtSwapBack(i);
                 }
             }
-            
+
             objectsToRemove.Clear();
             requiresBoundsUpdate = true;
             return;
@@ -630,7 +692,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
     private void DisposeGroup()
     {
         CompleteJobs();
-        
+
         if (cullingGroup != null)
         {
             cullingGroup.onStateChanged -= OnStateChanged;
@@ -640,10 +702,10 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
 
         if (boundingSpheres.IsCreated)
             boundingSpheres.Dispose();
-            
+
         if (objects.IsCreated)
             objects.Dispose();
-            
+
         if (dynamicObjectIndices.IsCreated)
             dynamicObjectIndices.Dispose();
     }
@@ -711,7 +773,7 @@ public sealed class AdvancedVisibilityManager : MonoBehaviour
         {
             int objIndex = DynamicIndices[index];
             var obj = Objects[objIndex];
-            if (obj.transform == null || !obj.transform.hasChanged) 
+            if (obj.transform == null || !obj.transform.hasChanged)
                 return;
 
             bool positionChanged = Vector3.Distance(obj.transform.position, obj.lastPosition) > ChangeThreshold;
@@ -862,7 +924,6 @@ public class AdvancedVisibilityManagerEditor : Editor
     }
 }
 
-// ReadOnly attribute for Inspector
 public class ReadOnlyAttribute : PropertyAttribute { }
 [CustomPropertyDrawer(typeof(ReadOnlyAttribute))]
 public class ReadOnlyDrawer : PropertyDrawer
