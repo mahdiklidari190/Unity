@@ -34,8 +34,8 @@ autoLODSelection: فعال‌سازی انتخاب خودکار سطح LOD.
 
 3. فراخوانی دستی در کد:
 
-'AdvancedVisibilityManager.Instance.RegisterObject(myObject);
-AdvancedVisibilityManager.Instance.UnregisterObject(myObject);'
+```AdvancedVisibilityManager.Instance.RegisterObject(myObject);```
+```AdvancedVisibilityManager.Instance.UnregisterObject(myObject);```
 
 4. ذخیره وضعیت در Editor:
 
@@ -105,8 +105,8 @@ autoLODSelection: Automatically manage LOD levels.
 
 3. Call from Code:
 
-'AdvancedVisibilityManager.Instance.RegisterObject(myObject);
-AdvancedVisibilityManager.Instance.UnregisterObject(myObject);'
+```AdvancedVisibilityManager.Instance.RegisterObject(myObject);```
+```AdvancedVisibilityManager.Instance.UnregisterObject(myObject);```
 
 4. Export Visibility State (Editor):
 
