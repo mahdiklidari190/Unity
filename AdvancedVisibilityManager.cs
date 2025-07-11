@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Unity.Collections;
 using Unity.Jobs;
+using Unity.Burst;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -11,7 +12,7 @@ using UnityEditorInternal;
 
 [DisallowMultipleComponent]
 [HelpURL("https://docs.unity3d.com/ScriptReference/CullingGroup.html")]
-public partial class AdvancedVisibilityManager : MonoBehaviour
+public sealed class AdvancedVisibilityManager : MonoBehaviour
 {
     #region Settings
 
@@ -76,12 +77,15 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
     #region Private Variables
 
     private CullingGroup cullingGroup;
-    private NativeList<ObjectInfo> objects;
+    private NativeArray<ObjectInfo> objects;
     private NativeList<int> dynamicObjectIndices;
     private NativeArray<BoundingSphere> boundingSpheres;
     private Dictionary<GameObject, int> objectIndexMap = new();
     private int cleanupIndex = 0;
     private int frameCounter = 0;
+    private NativeList<JobHandle> activeJobHandles;
+    private NativeList<int> objectsToRemove;
+    private bool requiresBoundsUpdate = false;
 
     #endregion
 
@@ -97,6 +101,7 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
         public Quaternion lastRotation;
         public Vector3 lastScale;
         public bool isVisible;
+        public bool isMarkedForRemoval;
     }
 
     #endregion
@@ -122,28 +127,53 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     #region Unity Lifecycle
 
+    void Awake()
+    {
+        activeJobHandles = new NativeList<JobHandle>(Allocator.Persistent);
+        objectsToRemove = new NativeList<int>(Allocator.Persistent);
+    }
+
     void OnEnable()
     {
-        objects = new NativeList<ObjectInfo>(Allocator.Persistent);
-        dynamicObjectIndices = new NativeList<int>(Allocator.Persistent);
         InitializeSystem();
         Camera.onPreCull += OnCameraPreCull;
     }
 
     void Update()
     {
-        UpdateDynamicObjects();
+        CompleteJobs();
+        
+        if (requiresBoundsUpdate)
+        {
+            UpdateBoundingSpheres();
+            requiresBoundsUpdate = false;
+        }
+
+        ScheduleDynamicObjectsJob();
         CleanUpDestroyedObjects();
+    }
+
+    void LateUpdate()
+    {
+        CompleteJobs();
     }
 
     void OnDisable()
     {
         Camera.onPreCull -= OnCameraPreCull;
+        CompleteJobs();
     }
 
     void OnDestroy()
     {
+        CompleteJobs();
         DisposeGroup();
+        
+        if (activeJobHandles.IsCreated)
+            activeJobHandles.Dispose();
+            
+        if (objectsToRemove.IsCreated)
+            objectsToRemove.Dispose();
     }
 
     #endregion
@@ -151,15 +181,30 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
     #region Public Methods
 
     [ContextMenu("Refresh Objects")]
-    public void RefreshObjects() => InitializeSystem();
+    public void RefreshObjects()
+    {
+        CompleteJobs();
+        InitializeSystem();
+    }
 
     public void AddObject(GameObject target)
     {
-        if (target == null || ((1 << target.layer) & targetLayer) == 0) return;
+        if (target == null || ((1 << target.layer) & targetLayer) == 0) 
+            return;
 
         var rend = target.GetComponent<Renderer>();
         var lod = target.GetComponent<LODGroup>();
-        if (rend == null && lod == null) return;
+        if (rend == null && lod == null) 
+            return;
+
+        CompleteJobs();
+
+        var newObjects = new NativeArray<ObjectInfo>(objects.Length + 1, Allocator.Temp);
+        if (objects.IsCreated && objects.Length > 0)
+        {
+            objects.CopyTo(newObjects.GetSubArray(0, objects.Length));
+            objects.Dispose();
+        }
 
         var objInfo = new ObjectInfo
         {
@@ -169,37 +214,41 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
             lastPosition = rend != null ? rend.transform.position : lod.transform.position,
             lastRotation = rend != null ? rend.transform.rotation : lod.transform.rotation,
             lastScale = rend != null ? rend.transform.localScale : lod.transform.localScale,
-            isVisible = false
+            isVisible = false,
+            isMarkedForRemoval = false
         };
 
-        int index = objects.Length;
-        objects.Add(objInfo);
+        int index = newObjects.Length - 1;
+        newObjects[index] = objInfo;
+        objects = new NativeArray<ObjectInfo>(newObjects, Allocator.Persistent);
+        newObjects.Dispose();
+
         objectIndexMap[target] = index;
 
         if (!areObjectsStatic && !target.isStatic)
+        {
             dynamicObjectIndices.Add(index);
+        }
 
         UpdateBoundingSphere(index);
-        UpdateCullingGroup();
+        requiresBoundsUpdate = true;
     }
 
     public void RemoveObject(GameObject target)
     {
-        if (target == null || !objectIndexMap.TryGetValue(target, out int index)) return;
+        if (target == null || !objectIndexMap.TryGetValue(target, out int index)) 
+            return;
 
-        objects.RemoveAt(index);
+        CompleteJobs();
+
+        var obj = objects[index];
+        obj.isMarkedForRemoval = true;
+        objects[index] = obj;
+        
+        objectsToRemove.Add(index);
         objectIndexMap.Remove(target);
-        dynamicObjectIndices.RemoveAtSwapBack(dynamicObjectIndices.IndexOf(index));
-
-        // Update indices in objectIndexMap
-        for (int i = index; i < objects.Length; i++)
-        {
-            if (objects[i].transform != null)
-                objectIndexMap[objects[i].transform.gameObject] = i;
-        }
-
-        UpdateBoundingSpheres();
-        UpdateCullingGroup();
+        
+        requiresBoundsUpdate = true;
     }
 
     #endregion
@@ -208,7 +257,8 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     private void InitializeSystem()
     {
-        if (!ValidateCamera()) return;
+        if (!ValidateCamera()) 
+            return;
 
         InitializeObjects();
         SetupCullingGroup();
@@ -258,11 +308,18 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     private void ClearCollections()
     {
-        objects.Clear();
-        dynamicObjectIndices.Clear();
-        objectIndexMap.Clear();
+        if (objects.IsCreated)
+            objects.Dispose();
+            
+        if (dynamicObjectIndices.IsCreated)
+            dynamicObjectIndices.Dispose();
+            
         if (boundingSpheres.IsCreated)
             boundingSpheres.Dispose();
+
+        dynamicObjectIndices = new NativeList<int>(Allocator.Persistent);
+        objectIndexMap.Clear();
+        objectsToRemove.Clear();
     }
 
     private void CacheTransforms()
@@ -275,9 +332,13 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
             return;
         }
 
-        foreach (var target in targets)
+        objects = new NativeArray<ObjectInfo>(targets.Length, Allocator.Persistent);
+
+        for (int i = 0; i < targets.Length; i++)
         {
-            if (target == null || ((1 << target.layer) & targetLayer) == 0) continue;
+            var target = targets[i];
+            if (target == null || ((1 << target.layer) & targetLayer) == 0) 
+                continue;
 
             var rend = target.GetComponent<Renderer>();
             var lod = target.GetComponent<LODGroup>();
@@ -292,15 +353,15 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
                     lastPosition = rend != null ? rend.transform.position : lod.transform.position,
                     lastRotation = rend != null ? rend.transform.rotation : lod.transform.rotation,
                     lastScale = rend != null ? rend.transform.localScale : lod.transform.localScale,
-                    isVisible = false
+                    isVisible = false,
+                    isMarkedForRemoval = false
                 };
 
-                int index = objects.Length;
-                objects.Add(objInfo);
-                objectIndexMap[target] = index;
+                objects[i] = objInfo;
+                objectIndexMap[target] = i;
 
                 if (!areObjectsStatic && !target.isStatic)
-                    dynamicObjectIndices.Add(index);
+                    dynamicObjectIndices.Add(i);
             }
         }
     }
@@ -323,10 +384,18 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     private void UpdateBoundingSpheres()
     {
-        if (boundingSpheres.IsCreated)
+        if (!objects.IsCreated || objects.Length == 0)
+        {
+            if (boundingSpheres.IsCreated)
+                boundingSpheres.Dispose();
+            return;
+        }
+
+        if (boundingSpheres.IsCreated && boundingSpheres.Length != objects.Length)
             boundingSpheres.Dispose();
 
-        boundingSpheres = new NativeArray<BoundingSphere>(objects.Length, Allocator.Persistent);
+        if (!boundingSpheres.IsCreated)
+            boundingSpheres = new NativeArray<BoundingSphere>(objects.Length, Allocator.Persistent);
 
         var job = new UpdateBoundingSpheresJob
         {
@@ -335,11 +404,14 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
         };
 
         JobHandle handle = job.Schedule(objects.Length, 64);
-        handle.Complete();
+        activeJobHandles.Add(handle);
     }
 
     private void UpdateBoundingSphere(int index)
     {
+        if (!objects.IsCreated || index < 0 || index >= objects.Length)
+            return;
+
         var obj = objects[index];
         BoundingSphere sphere;
 
@@ -368,14 +440,15 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
             sphere = new BoundingSphere(obj.transform?.position ?? Vector3.zero, 0f);
         }
 
-        boundingSpheres[index] = sphere;
+        if (boundingSpheres.IsCreated && index < boundingSpheres.Length)
+            boundingSpheres[index] = sphere;
     }
 
     private void SetupCullingGroup()
     {
         DisposeGroup();
 
-        if (objects.Length == 0)
+        if (!objects.IsCreated || objects.Length == 0)
         {
             if (debugLevel >= LogLevel.Warnings)
                 Debug.LogWarning("[VisibilityManager] No objects to cull, CullingGroup not created.");
@@ -389,8 +462,7 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
             enableOcclusionCulling = useOcclusionCulling
         };
 
-        cullingGroup.SetBoundingSpheres(boundingSpheres);
-        cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
+        UpdateCullingGroup();
 
         if (distanceBands != null && distanceBands.Length > 0)
             cullingGroup.SetDistanceBands(distanceBands);
@@ -398,7 +470,7 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     private void UpdateCullingGroup()
     {
-        if (cullingGroup == null || objects.Length == 0)
+        if (cullingGroup == null || !objects.IsCreated || objects.Length == 0)
         {
             SetupCullingGroup();
             return;
@@ -408,9 +480,10 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
         cullingGroup.SetBoundingSphereCount(boundingSpheres.Length);
     }
 
-    private void UpdateDynamicObjects()
+    private void ScheduleDynamicObjectsJob()
     {
-        if (areObjectsStatic || !boundingSpheres.IsCreated) return;
+        if (areObjectsStatic || !boundingSpheres.IsCreated || dynamicObjectIndices.Length == 0) 
+            return;
 
         var job = new UpdateDynamicObjectsJob
         {
@@ -421,7 +494,16 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
         };
 
         JobHandle handle = job.Schedule(dynamicObjectIndices.Length, 64);
-        handle.Complete();
+        activeJobHandles.Add(handle);
+    }
+
+    private void CompleteJobs()
+    {
+        if (!activeJobHandles.IsCreated || activeJobHandles.Length == 0)
+            return;
+
+        JobHandle.CompleteAll(activeJobHandles);
+        activeJobHandles.Clear();
     }
 
     private void OnStateChanged(CullingGroupEvent evt)
@@ -431,18 +513,18 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
             if (evt.index < 0 || evt.index >= objects.Length)
                 return;
 
+            var obj = objects[evt.index];
+            if (obj.isMarkedForRemoval || obj.transform == null)
+                return;
+
             bool visible = evt.isVisible;
             if (distanceBands != null && distanceBands.Length > 0)
                 visible &= evt.currentDistance < distanceBands.Length;
 
-            var obj = objects[evt.index];
             obj.isVisible = visible;
             objects[evt.index] = obj;
 
-            if (visible)
-                visibleObjectCount++;
-            else
-                visibleObjectCount = Mathf.Max(0, visibleObjectCount - 1);
+            visibleObjectCount = Mathf.Max(0, visible ? visibleObjectCount + 1 : visibleObjectCount - 1);
 
             OnVisibilityChanged?.Invoke(evt.index, visible, evt.currentDistance);
 
@@ -465,6 +547,8 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
     private void HandleLODVisibility(int index, bool isGroupVisible, float distance)
     {
         var lodGroup = objects[index].lodGroup;
+        if (lodGroup == null) return;
+
         lodGroup.enabled = isGroupVisible;
 
         if (!isGroupVisible) return;
@@ -483,8 +567,44 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     private void CleanUpDestroyedObjects()
     {
-        if (objects.Length == 0 || frameCounter++ % cleanupInterval != 0) return;
+        if (!objects.IsCreated || objects.Length == 0 || frameCounter++ % cleanupInterval != 0) 
+            return;
 
+        CompleteJobs();
+
+        // First process marked objects
+        if (objectsToRemove.Length > 0)
+        {
+            var newObjects = new NativeArray<ObjectInfo>(objects.Length - objectsToRemove.Length, Allocator.Temp);
+            int newIndex = 0;
+            
+            for (int i = 0; i < objects.Length; i++)
+            {
+                if (!objectsToRemove.Contains(i))
+                {
+                    newObjects[newIndex++] = objects[i];
+                }
+            }
+            
+            objects.Dispose();
+            objects = new NativeArray<ObjectInfo>(newObjects, Allocator.Persistent);
+            newObjects.Dispose();
+            
+            // Update dynamic indices
+            for (int i = dynamicObjectIndices.Length - 1; i >= 0; i--)
+            {
+                if (objectsToRemove.Contains(dynamicObjectIndices[i]))
+                {
+                    dynamicObjectIndices.RemoveAtSwapBack(i);
+                }
+            }
+            
+            objectsToRemove.Clear();
+            requiresBoundsUpdate = true;
+            return;
+        }
+
+        // Then check for null transforms
         int itemsToCheck = Mathf.Min(cleanupBatchSize, objects.Length);
         bool needsUpdate = false;
 
@@ -493,20 +613,9 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
             int index = (cleanupIndex + i) % objects.Length;
             if (objects[index].transform == null)
             {
+                objectsToRemove.Add(index);
                 objectIndexMap.Remove(objects[index].transform?.gameObject);
-                objects.RemoveAt(index);
-                dynamicObjectIndices.RemoveAtSwapBack(dynamicObjectIndices.IndexOf(index));
-
                 needsUpdate = true;
-                i--;
-                itemsToCheck = Mathf.Min(cleanupBatchSize, objects.Length);
-
-                // Update indices in objectIndexMap
-                for (int j = index; j < objects.Length; j++)
-                {
-                    if (objects[j].transform != null)
-                        objectIndexMap[objects[j].transform.gameObject] = j;
-                }
             }
         }
 
@@ -514,24 +623,14 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
         if (needsUpdate)
         {
-            var newSpheres = new NativeArray<BoundingSphere>(objects.Length, Allocator.Persistent);
-            for (int i = 0; i < objects.Length; i++)
-            {
-                if (i < boundingSpheres.Length && objects[i].transform != null)
-                    newSpheres[i] = boundingSpheres[i];
-                else
-                    UpdateBoundingSphere(i);
-            }
-            if (boundingSpheres.IsCreated)
-                boundingSpheres.Dispose();
-            boundingSpheres = newSpheres;
-
-            UpdateCullingGroup();
+            requiresBoundsUpdate = true;
         }
     }
 
     private void DisposeGroup()
     {
+        CompleteJobs();
+        
         if (cullingGroup != null)
         {
             cullingGroup.onStateChanged -= OnStateChanged;
@@ -541,8 +640,10 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
         if (boundingSpheres.IsCreated)
             boundingSpheres.Dispose();
+            
         if (objects.IsCreated)
             objects.Dispose();
+            
         if (dynamicObjectIndices.IsCreated)
             dynamicObjectIndices.Dispose();
     }
@@ -551,6 +652,7 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
     {
         if (cam == targetCamera && cullingGroup != null)
         {
+            CompleteJobs();
             UpdateCullingGroup();
         }
     }
@@ -559,10 +661,10 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
 
     #region Jobs
 
-    [Unity.Burst.BurstCompile]
+    [BurstCompile]
     private struct UpdateBoundingSpheresJob : IJobParallelFor
     {
-        [ReadOnly] public NativeList<ObjectInfo> Objects;
+        [ReadOnly] public NativeArray<ObjectInfo> Objects;
         [WriteOnly] public NativeArray<BoundingSphere> BoundingSpheres;
 
         public void Execute(int index)
@@ -597,10 +699,10 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
         }
     }
 
-    [Unity.Burst.BurstCompile]
+    [BurstCompile]
     private struct UpdateDynamicObjectsJob : IJobParallelFor
     {
-        public NativeList<ObjectInfo> Objects;
+        public NativeArray<ObjectInfo> Objects;
         [ReadOnly] public NativeList<int> DynamicIndices;
         public NativeArray<BoundingSphere> BoundingSpheres;
         public float ChangeThreshold;
@@ -609,7 +711,8 @@ public partial class AdvancedVisibilityManager : MonoBehaviour
         {
             int objIndex = DynamicIndices[index];
             var obj = Objects[objIndex];
-            if (obj.transform == null || !obj.transform.hasChanged) return;
+            if (obj.transform == null || !obj.transform.hasChanged) 
+                return;
 
             bool positionChanged = Vector3.Distance(obj.transform.position, obj.lastPosition) > ChangeThreshold;
             bool rotationChanged = Quaternion.Angle(obj.transform.rotation, obj.lastRotation) > ChangeThreshold;
